@@ -36,6 +36,7 @@
 #include <fcntl.h>
 
 #include <indigo/indigo_driver_xml.h>
+#include <indigo/indigo_server_tcp.h>
 #include <indigo/indigo_io.h>
 #include <indigo/indigo_align.h>
 #include <indigo/indigo_align.h>
@@ -363,6 +364,9 @@ static void create_frame(indigo_device *device) {
 				raw[i] = rgb  + (rand() & 0x0F);
 			else
 				raw[i] = rgb;
+		}
+		if (CCD_STREAMING_PROPERTY->state == INDIGO_BUSY_STATE) {
+			indigo_frame_preview_publish_rgb24(raw, size, DSLR_WIDTH, DSLR_HEIGHT);
 		}
 		if (CCD_IMAGE_FORMAT_NATIVE_ITEM->sw.value) {
 			void *data_out;

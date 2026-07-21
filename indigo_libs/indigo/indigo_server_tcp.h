@@ -34,6 +34,7 @@ extern "C" {
 
 #define MDNS_INDIGO_TYPE    "_indigo._tcp"
 #define MDNS_HTTP_TYPE      "_http._tcp"
+#define INDIGO_FRAME_PREVIEW_MAGIC 0x31565246u /* "FRV1" little-endian */
 
 /** Prototype of callback function for network server (providing number of active clients).
  */
@@ -78,6 +79,13 @@ extern void indigo_server_remove_resource(const char *path);
 /** Remove all documents.
  */
 extern void indigo_server_remove_resources(void);
+
+/** Serve an already-upgraded Frame View RGB24 WebSocket client. */
+extern void indigo_frame_preview_handle_ws(int socket);
+
+/** Publish a tightly-packed RGB24 frame to /api/streaming/frame clients. */
+extern void indigo_frame_preview_publish_rgb24(const void *pixels, uint32_t pixels_len,
+                                               uint16_t width, uint16_t height);
 	
 /** Start network server (function will block until server is active).
  */

@@ -171,6 +171,7 @@
 							<div id="image_container" class="card p-1 m-1 bg-light" style="min-height: 10rem">
 								<div class="card-block">
 									<div class="card p-0 border-0" style="display: none">
+										<canvas id="frame_preview_canvas" class="img-fluid rounded" style="display:none;max-width:100%;height:auto"></canvas>
 										<img id="image" class="img-fluid rounded"/>
 										<img id="histogram" width="128" height="64" style="position: absolute; top:10px;left:10px;display:none"/>
 									</div>
@@ -235,6 +236,7 @@
 	
 		var targetExposureTime = 0;
 		var repeatExposure = false;
+		var framePreviewSocket = null;
 		var downloadInProgress = false;
 		var downloadURL = "";
 		var downloadFileName = "";
@@ -248,7 +250,7 @@
 					changeProperty("Imager Agent", "FILTER_RELATED_AGENT_LIST", { "Guider Agent" : true });
 				}
 			} else if (property.name == "CCD_PREVIEW_IMAGE") {
-				if (property.state == "Ok") {
+				if (property.state == "Ok" && framePreviewSocket == null) {
 					var value = property.item("IMAGE").value;
 					if (value != null) {
 						if (value.startsWith("http://"))
@@ -266,7 +268,7 @@
 				if (property.name == "AGENT_IMAGER_BATCH" && property.state == "Ok") {
 					targetExposureTime = property.item("EXPOSURE").value;
 				} else if (property.name == "CCD_PREVIEW_IMAGE") {
-					if (property.state == "Ok") {
+					if (property.state == "Ok" && framePreviewSocket == null) {
 						var value = property.item("IMAGE").value;
 						if (value != null) {
 							if (value.startsWith("http://"))
@@ -323,6 +325,14 @@
 						$("#preview1_button").addClass("idle-state");
 						$("#preview_button").removeClass("busy-state");
 						$("#preview_button").addClass("idle-state");
+					}
+				} else if (property.name == "CCD_STREAMING") {
+					if (property.state == "Busy") {
+						$("#preview_button").removeClass("idle-state").addClass("busy-state");
+					} else {
+						repeatExposure = false;
+						closeFramePreviewSocket();
+						$("#preview_button").removeClass("busy-state").addClass("idle-state");
 					}
 				} else if (property.name == "AGENT_START_PROCESS") {
 					if (property.state == "Ok") {
@@ -396,13 +406,14 @@
 		}
 	
 		function preview() {
-			repeatExposure = true;
+			repeatExposure = false;
 			$("#preview_button").removeClass("idle-state");
 			$("#preview_button").addClass("busy-state");
 			INDIGO.useAgent = false;
 			changeProperty("Imager Agent", "CCD_UPLOAD_MODE", { "CLIENT" : true });
 			changeProperty("Imager Agent", "CCD_PREVIEW", { "ENABLED_WITH_HISTOGRAM" : true });
-			changeProperty("Imager Agent", "CCD_EXPOSURE", { "EXPOSURE": targetExposureTime });
+			openFramePreviewSocket();
+			changeProperty("Imager Agent", "CCD_STREAMING", { "COUNT": -1, "EXPOSURE": targetExposureTime });
 		}
 	
 		function capture_batch() {
@@ -434,9 +445,66 @@
 	
 	function stop() {
 		repeatExposure = false;
+		closeFramePreviewSocket();
 		changeProperty("Imager Agent", "AGENT_ABORT_PROCESS", { "ABORT": true });
 		changeProperty("Imager Agent", "CCD_ABORT_EXPOSURE", { "ABORT_EXPOSURE": true });
 	}
+
+		var FRAME_PREVIEW_MAGIC = 0x31565246; // "FRV1" little-endian
+		var FRAME_PREVIEW_HEADER_BYTES = 24;
+
+		function openFramePreviewSocket() {
+			if (framePreviewSocket != null) return;
+			var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+			var ws = new WebSocket(protocol + window.location.host + '/api/streaming/frame');
+			ws.binaryType = 'arraybuffer';
+			ws.onmessage = function(event) {
+				if (event.data instanceof ArrayBuffer) renderFramePreview(event.data);
+			};
+			ws.onclose = function() {
+				if (framePreviewSocket === ws) framePreviewSocket = null;
+			};
+			ws.onerror = function() { try { ws.close(); } catch (e) {} };
+			framePreviewSocket = ws;
+			$("#image, #histogram").hide();
+			$("#frame_preview_canvas").show().parent().show();
+		}
+
+		function closeFramePreviewSocket() {
+			if (framePreviewSocket != null) {
+				var ws = framePreviewSocket;
+				framePreviewSocket = null;
+				try { ws.close(); } catch (e) {}
+			}
+			$("#frame_preview_canvas").hide();
+		}
+
+		function renderFramePreview(buffer) {
+			if (buffer.byteLength < FRAME_PREVIEW_HEADER_BYTES) return;
+			var view = new DataView(buffer);
+			var width = view.getUint16(4, true);
+			var height = view.getUint16(6, true);
+			if (view.getUint32(0, true) !== FRAME_PREVIEW_MAGIC ||
+				view.getUint16(20, true) !== 24 || view.getUint8(22) !== 3 ||
+				width === 0 || height === 0 ||
+				buffer.byteLength !== FRAME_PREVIEW_HEADER_BYTES + width * height * 3) return;
+
+			var canvas = document.getElementById('frame_preview_canvas');
+			if (!canvas) return;
+			canvas.width = width;
+			canvas.height = height;
+			var image = canvas.getContext('2d').createImageData(width, height);
+			var pixels = new Uint8Array(buffer, FRAME_PREVIEW_HEADER_BYTES);
+			for (var source = 0, destination = 0; source < pixels.length; source += 3, destination += 4) {
+				image.data[destination] = pixels[source];
+				image.data[destination + 1] = pixels[source + 1];
+				image.data[destination + 2] = pixels[source + 2];
+				image.data[destination + 3] = 255;
+			}
+			canvas.getContext('2d').putImageData(image, 0, 0);
+		}
+
+		window.addEventListener('beforeunload', closeFramePreviewSocket);
 
 	function focuser_position() {
 		var position = parseInt($("#steps").val());

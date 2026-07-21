@@ -94,6 +94,218 @@ static struct resource {
 } *resources = NULL;
 
 #define BUFFER_SIZE	1024
+#define FRAME_PREVIEW_MAX_CLIENTS 8
+#define FRAME_PREVIEW_POLL_MS 200
+
+/* One slot per attached /api/streaming/frame client.
+   Each slot is a single-frame mailbox: the publisher overwrites 'pending' with the newest
+   frame and returns, the client's own thread drains it. Latest wins, older frames are
+   dropped. The socket is owned exclusively by that client thread, so the publisher never
+   touches a file descriptor and never blocks on the network. */
+typedef struct {
+	int socket;
+	bool active;
+	uint8_t *pending;
+	size_t pending_size;
+	pthread_cond_t cond;
+} frame_preview_client;
+
+static struct {
+	frame_preview_client clients[FRAME_PREVIEW_MAX_CLIENTS];
+	pthread_mutex_t mutex;
+	uint32_t seq;
+} frame_preview_registry = {
+	.mutex = PTHREAD_MUTEX_INITIALIZER
+};
+
+static bool frame_preview_send_all(int socket, const void *buffer, size_t size) {
+	const uint8_t *data = buffer;
+	int flags = 0;
+#ifdef MSG_NOSIGNAL
+	flags = MSG_NOSIGNAL;
+#endif
+	while (size > 0) {
+		ssize_t written = send(socket, data, size, flags);
+		if (written < 0) {
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (written == 0)
+			return false;
+		data += written;
+		size -= (size_t)written;
+	}
+	return true;
+}
+
+void indigo_frame_preview_publish_rgb24(const void *pixels, uint32_t pixels_len, uint16_t width, uint16_t height) {
+	uint64_t payload_size = (uint64_t)width * height * 3;
+	if (!pixels || width == 0 || height == 0 || payload_size > UINT32_MAX || pixels_len != payload_size)
+		return;
+
+	pthread_mutex_lock(&frame_preview_registry.mutex);
+	int count = 0;
+	for (int i = 0; i < FRAME_PREVIEW_MAX_CLIENTS; i++) {
+		if (frame_preview_registry.clients[i].active)
+			count++;
+	}
+	uint32_t seq = ++frame_preview_registry.seq;
+	pthread_mutex_unlock(&frame_preview_registry.mutex);
+	if (count == 0)
+		return;
+
+	struct timespec now;
+	clock_gettime(CLOCK_REALTIME, &now);
+	struct __attribute__((packed)) {
+		uint32_t magic;
+		uint16_t width, height;
+		uint32_t seq;
+		uint64_t timestamp_ms;
+		uint16_t bpp;
+		uint8_t channels, reserved;
+	} header = {
+		.magic = INDIGO_FRAME_PREVIEW_MAGIC,
+		.width = width,
+		.height = height,
+		.seq = seq,
+		.timestamp_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000,
+		.bpp = 24,
+		.channels = 3
+	};
+	uint64_t body_size = sizeof(header) + payload_size;
+	size_t ws_header_size = body_size <= 125 ? 2 : body_size <= UINT16_MAX ? 4 : 10;
+	uint8_t *frame = malloc(ws_header_size + (size_t)body_size);
+	if (!frame)
+		return;
+	frame[0] = 0x82;
+	if (ws_header_size == 2) {
+		frame[1] = (uint8_t)body_size;
+	} else if (ws_header_size == 4) {
+		frame[1] = 126;
+		frame[2] = (uint8_t)(body_size >> 8);
+		frame[3] = (uint8_t)body_size;
+	} else {
+		frame[1] = 127;
+		for (int i = 0; i < 8; i++)
+			frame[2 + i] = (uint8_t)(body_size >> (8 * (7 - i)));
+	}
+	memcpy(frame + ws_header_size, &header, sizeof(header));
+	memcpy(frame + ws_header_size + sizeof(header), pixels, pixels_len);
+	size_t frame_size = ws_header_size + (size_t)body_size;
+
+	/* Hand the frame to every attached client and return. The last recipient takes ownership
+	   of the buffer we just built so the common single-client case copies nothing extra. */
+	bool frame_donated = false;
+	pthread_mutex_lock(&frame_preview_registry.mutex);
+	int remaining = 0;
+	for (int i = 0; i < FRAME_PREVIEW_MAX_CLIENTS; i++) {
+		if (frame_preview_registry.clients[i].active)
+			remaining++;
+	}
+	for (int i = 0; i < FRAME_PREVIEW_MAX_CLIENTS; i++) {
+		frame_preview_client *client = &frame_preview_registry.clients[i];
+		if (!client->active)
+			continue;
+		uint8_t *copy;
+		if (--remaining == 0) {
+			copy = frame;
+			frame_donated = true;
+		} else if (!(copy = malloc(frame_size))) {
+			continue;
+		} else {
+			memcpy(copy, frame, frame_size);
+		}
+		free(client->pending);
+		client->pending = copy;
+		client->pending_size = frame_size;
+		pthread_cond_signal(&client->cond);
+	}
+	pthread_mutex_unlock(&frame_preview_registry.mutex);
+	if (!frame_donated)
+		free(frame);
+}
+
+/* Detect a client that closed or reset the connection. This path is server-to-client only,
+   so anything readable is either a close frame or noise: both are discarded, and end-of-stream
+   or a hard error ends the session. */
+static bool frame_preview_peer_gone(int socket) {
+	char discard[256];
+	while (true) {
+		ssize_t count = recv(socket, discard, sizeof(discard), MSG_DONTWAIT);
+		if (count > 0)
+			continue;
+		if (count == 0)
+			return true;
+		if (errno == EINTR)
+			continue;
+		return errno != EAGAIN && errno != EWOULDBLOCK;
+	}
+}
+
+void indigo_frame_preview_handle_ws(int socket) {
+	frame_preview_client *client = NULL;
+	pthread_mutex_lock(&frame_preview_registry.mutex);
+	for (int i = 0; i < FRAME_PREVIEW_MAX_CLIENTS; i++) {
+		if (!frame_preview_registry.clients[i].active) {
+			client = &frame_preview_registry.clients[i];
+			client->socket = socket;
+			client->active = true;
+			client->pending = NULL;
+			client->pending_size = 0;
+			pthread_cond_init(&client->cond, NULL);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&frame_preview_registry.mutex);
+	if (!client)
+		return;
+
+	while (true) {
+		pthread_mutex_lock(&frame_preview_registry.mutex);
+		while (!client->pending) {
+			struct timespec deadline;
+			clock_gettime(CLOCK_REALTIME, &deadline);
+			deadline.tv_nsec += FRAME_PREVIEW_POLL_MS * 1000000L;
+			if (deadline.tv_nsec >= 1000000000L) {
+				deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+				deadline.tv_nsec %= 1000000000L;
+			}
+			if (pthread_cond_timedwait(&client->cond, &frame_preview_registry.mutex, &deadline) == ETIMEDOUT)
+				break;
+		}
+		uint8_t *frame = client->pending;
+		size_t frame_size = client->pending_size;
+		client->pending = NULL;
+		client->pending_size = 0;
+		pthread_mutex_unlock(&frame_preview_registry.mutex);
+
+		/* Checked between frames, so a client that never sends anything still gets reaped
+		   once its socket reports EOF rather than only when a send finally fails. */
+		if (frame_preview_peer_gone(socket)) {
+			free(frame);
+			break;
+		}
+		if (frame) {
+			/* Blocking send, bounded by the accept-time SO_SNDTIMEO. A timeout leaves the
+			   WebSocket stream truncated mid-frame with no way to resync, so the only correct
+			   response is to drop this client. It costs the publisher nothing either way. */
+			bool sent = frame_preview_send_all(socket, frame, frame_size);
+			free(frame);
+			if (!sent)
+				break;
+		}
+	}
+
+	pthread_mutex_lock(&frame_preview_registry.mutex);
+	free(client->pending);
+	client->pending = NULL;
+	client->pending_size = 0;
+	client->active = false;
+	client->socket = -1;
+	pthread_cond_destroy(&client->cond);
+	pthread_mutex_unlock(&frame_preview_registry.mutex);
+}
 
 static void start_worker_thread(int *client_socket) {
 	int socket = *client_socket;
@@ -151,7 +363,22 @@ static void start_worker_thread(int *client_socket) {
 								use_imagebytes = true;
 						}
 					}
-					if (!strcmp(path, "/")) {
+					if (!strcmp(path, "/api/streaming/frame") && *websocket_key) {
+						unsigned char sha_hash[SHA1_SIZE];
+						memset(sha_hash, 0, sizeof(sha_hash));
+						strcat(websocket_key, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+						sha1(sha_hash, websocket_key, strlen(websocket_key));
+						INDIGO_PRINTF(socket, "HTTP/1.1 101 Switching Protocols\r\n");
+						INDIGO_PRINTF(socket, "Server: INDIGO/%d.%d-%s\r\n", (INDIGO_VERSION_CURRENT >> 8) & 0xFF, INDIGO_VERSION_CURRENT & 0xFF, INDIGO_BUILD);
+						INDIGO_PRINTF(socket, "Upgrade: websocket\r\n");
+						INDIGO_PRINTF(socket, "Connection: upgrade\r\n");
+						base64_encode((unsigned char *)websocket_key, sha_hash, sizeof(sha_hash));
+						INDIGO_PRINTF(socket, "Sec-WebSocket-Accept: %s\r\n", websocket_key);
+						INDIGO_PRINTF(socket, "\r\n");
+						INDIGO_TRACE(indigo_trace("%d <- // Frame preview WebSocket connected", socket));
+						indigo_frame_preview_handle_ws(socket);
+						keep_alive = false;
+					} else if (!strcmp(path, "/")) {
 						if (*websocket_key) {
 							unsigned char shaHash[SHA1_SIZE];
 							memset(shaHash, 0, sizeof(shaHash));
